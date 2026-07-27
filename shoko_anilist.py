@@ -11,7 +11,7 @@ SHOKO_HOST = "127.0.0.1"
 SHOKO_PORT = 8111
 SHOKO_API_KEY = ""
 
-ANILIST_TOKEN = "Bearer "
+ANILIST_TOKEN = "Bearer ""
 
 SHOKO_API_URL = f"http://{SHOKO_HOST}:{SHOKO_PORT}/api/v3"
 ANILIST_API_URL = "https://graphql.anilist.co"
