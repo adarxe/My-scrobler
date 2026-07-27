@@ -1,21 +1,24 @@
-import os 
+import os
 import time
 import sqlite3
 import requests
 from datetime import datetime
+from dotenv import load_dotenv
 
 # ==========================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN Y AMBIENTE
 # ==========================================
-SHOKO_HOST = "127.0.0.1"
-SHOKO_PORT = 8111
-SHOKO_API_KEY = ""
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-ANILIST_TOKEN = "Bearer ""
+SHOKO_HOST = os.getenv("SHOKO_HOST", "127.0.0.1")
+SHOKO_PORT = os.getenv("SHOKO_PORT", "8111")
+SHOKO_API_KEY = os.getenv("SHOKO_API_KEY")
+
+ANILIST_TOKEN = os.getenv("ANILIST_TOKEN")
 
 SHOKO_API_URL = f"http://{SHOKO_HOST}:{SHOKO_PORT}/api/v3"
 ANILIST_API_URL = "https://graphql.anilist.co"
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(BASE_DIR, "historial_anime.db")
 INTERVALO_CONSULTA = 20  # Revisa cada 20 segundos
 MAX_REINTENTOS = 5
@@ -55,17 +58,30 @@ def obtener_estado_episodio(episode_id):
     cursor.execute("SELECT estado, anilist_id FROM episodios_sync WHERE episode_id = ?", (episode_id,))
     res = cursor.fetchone()
     conexion.close()
-    return res  # Devuelve (estado, anilist_id) o None si no existe
+    return res
 
-def encolar_episodio(episode_id, series_id, mal_id, numero_episodio):
+def buscar_anilist_id_cache(mal_id):
+    """Busca en SQLite si ya descubrimos el AniList ID para este MAL ID en el pasado."""
+    conexion = sqlite3.connect(DB_NAME)
+    cursor = conexion.cursor()
+    cursor.execute("""
+        SELECT anilist_id FROM episodios_sync 
+        WHERE mal_id = ? AND anilist_id IS NOT NULL AND anilist_id != 'N/A' 
+        LIMIT 1
+    """, (mal_id,))
+    res = cursor.fetchone()
+    conexion.close()
+    return res[0] if res else None
+
+def encolar_episodio(episode_id, series_id, mal_id, numero_episodio, anilist_id=None):
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     conexion = sqlite3.connect(DB_NAME)
     cursor = conexion.cursor()
     cursor.execute("""
         INSERT OR IGNORE INTO episodios_sync 
-        (episode_id, series_id, mal_id, numero_episodio, estado, fecha_detectado)
-        VALUES (?, ?, ?, ?, 'PENDIENTE', ?)
-    """, (episode_id, series_id, mal_id, numero_episodio, fecha))
+        (episode_id, series_id, mal_id, anilist_id, numero_episodio, estado, fecha_detectado)
+        VALUES (?, ?, ?, ?, ?, 'PENDIENTE', ?)
+    """, (episode_id, series_id, mal_id, anilist_id, numero_episodio, fecha))
     conexion.commit()
     conexion.close()
 
@@ -73,18 +89,21 @@ def actualizar_estado_episodio(episode_id, estado, anilist_id=None):
     fecha = datetime.now().strftime("%Y-%m-%d %H:%M:%S") if estado == 'ENVIADO' else None
     conexion = sqlite3.connect(DB_NAME)
     cursor = conexion.cursor()
+
+    # REGLA DE ORO: Jamás sobrescribir una fila que esté en estado 'ENVIADO'
     if estado == 'ENVIADO':
         cursor.execute("""
             UPDATE episodios_sync 
             SET estado = ?, anilist_id = ?, fecha_enviado = ?
-            WHERE episode_id = ?
+            WHERE episode_id = ? AND estado != 'ENVIADO'
         """, (estado, anilist_id, fecha, episode_id))
     else:
         cursor.execute("""
             UPDATE episodios_sync 
             SET estado = ?, intentos = intentos + 1
-            WHERE episode_id = ?
+            WHERE episode_id = ? AND estado != 'ENVIADO'
         """, (estado, episode_id))
+
     conexion.commit()
     conexion.close()
 
@@ -101,7 +120,7 @@ def obtener_pendientes_o_errores():
     return filas
 
 # ==========================================
-# INTEGACIÓN ANILIST
+# INTEGRACION ANILIST Y SHOKO
 # ==========================================
 def resolver_mal_a_anilist(mal_id):
     query = """
@@ -182,29 +201,28 @@ def escanear_y_encolar_shoko():
 
             for ep in episodios:
                 ep_id = ep.get("IDs", {}).get("ID") or ep.get("ID")
-                fecha_visto = ep.get("Watched")
-                watch_count = ep.get("WatchCount", 0)
 
-                es_visto = (fecha_visto is not None) or (watch_count > 0)
+                # CÓDIGO CLAVE: Verificar si Shoko confirmó que superó el 85% de reproducción
+                user_stats = ep.get("UserStats", {})
+                es_visto = user_stats.get("IsWatched", False)
+
                 if not ep_id or not es_visto:
                     continue
 
                 # VERIFICACIÓN DE IDEMPOTENCIA
                 info_db = obtener_estado_episodio(ep_id)
-                if info_db:
-                    estado_actual = info_db[0]
-                    if estado_actual == 'ENVIADO':
-                        # Proceso muere para este episodio
-                        continue
+                if info_db and info_db[0] == 'ENVIADO':
+                    continue
 
-                # Si no está en DB, obtenemos el número de episodio y lo encolamos
                 num_ep = obtener_numero_episodio(ep_id)
                 if not num_ep:
                     continue
 
                 if not info_db:
+                    # Intentar precargar el AniList ID desde la base local si ya existe para esta serie
+                    anilist_id_cached = buscar_anilist_id_cache(mal_id)
                     print(f"[+] Nuevo capítulo visto detectado en Shoko: Serie {series_id} | Ep {num_ep} (Encolando...)")
-                    encolar_episodio(ep_id, series_id, mal_id, num_ep)
+                    encolar_episodio(ep_id, series_id, mal_id, num_ep, anilist_id_cached)
 
     except Exception as e:
         print(f"[!] Error durante el escaneo de Shoko: {e}")
@@ -218,7 +236,11 @@ def procesar_cola_anilist():
         return
 
     for ep_id, series_id, mal_id, anilist_id, num_ep, intentos in pendientes:
-        # Resolver AniList ID si no lo tenemos guardado aún
+        # 1. Buscar en SQLite local si no lo teníamos en esta fila
+        if not anilist_id:
+            anilist_id = buscar_anilist_id_cache(mal_id)
+
+        # 2. Si sigue sin existir en local, consultar a la API de AniList
         if not anilist_id:
             anilist_id = resolver_mal_a_anilist(mal_id)
 
