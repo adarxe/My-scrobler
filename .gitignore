@@ -1,0 +1,13 @@
+# Archivos de entorno y secretos
+.env
+
+# Ignorar bases de datos de SQLite
+*.db
+*.sqlite3
+
+# Ignorar archivos de registro
+*.log
+
+# Ignorar carpetas caché de Python
+__pycache__/
+*.pyc
